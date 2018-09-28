@@ -5,7 +5,9 @@
 """Main logic for handling submit requests."""
 
 from datetime import datetime
-from flask import Flask, request
+from sanic import Sanic
+from sanic.request import Request
+from sanic.response import json, raw
 from functools import partial
 from google.cloud.pubsub_v1 import PublisherClient
 from google.cloud.pubsub_v1.publisher.exceptions import PublishError
@@ -14,11 +16,10 @@ from persistqueue import SQLiteAckQueue
 from persistqueue.exceptions import Empty
 from typing import Dict, Tuple
 import google.api_core.exceptions
-import json
 
 FLUSH_EMPTY_STATUS = 204
-FLUSH_COMPLETE_STATUS = 200
-FLUSH_INCOMPLETE_STATUS = 504
+FLUSH_DONE_STATUS = 200
+FLUSH_ERROR_STATUS = 504
 # Errors where message should be queued locally after pubsub delivery fails
 # To minimize data loss include errors that may require manual intervention
 TRANSIENT_ERRORS = (
@@ -65,7 +66,7 @@ def _publish(topic: str, data: bytes, attrs: Dict[str, str]) -> str:
         return response.message_ids[0]
 
 
-def flush(q: SQLiteAckQueue) -> Tuple[str, int]:
+def flush(request: Request, q: SQLiteAckQueue) -> Tuple[str, int]:
     """Flush messages from the local queue to pubsub.
 
     Call periodically on each docker container to ensure reliable delivery.
@@ -74,7 +75,7 @@ def flush(q: SQLiteAckQueue) -> Tuple[str, int]:
     """
     if q.size == 0:
         # early return for empty queue
-        return "", FLUSH_EMPTY_STATUS
+        return raw(b"", FLUSH_EMPTY_STATUS)
     done = 0
     # while queue has messages ready to process
     while q.size > 0:
@@ -89,8 +90,7 @@ def flush(q: SQLiteAckQueue) -> Tuple[str, int]:
             # message not delivered
             q.nack(message)
             # transient errors stop processing queue until next flush
-            response = json.dumps(dict(done=done, pending=q.size))
-            return response, FLUSH_INCOMPLETE_STATUS
+            return json(dict(done=done, pending=q.size), FLUSH_ERROR_STATUS)
         except:  # noqa: E722
             # message not delivered
             q.nack(message)
@@ -99,15 +99,16 @@ def flush(q: SQLiteAckQueue) -> Tuple[str, int]:
         else:
             q.ack(message)
             done += 1
-    return json.dumps(dict(done=done, pending=0)), FLUSH_COMPLETE_STATUS
+    return json(dict(done=done, pending=0), FLUSH_DONE_STATUS)
 
 
-def submit(q: SQLiteAckQueue, topic: str, **kwargs) -> Tuple[str, int]:
+def submit(request: Request, q: SQLiteAckQueue, topic: str,
+           **kwargs) -> Tuple[str, int]:
     """Deliver request to the pubsub topic.
 
     Deliver to the local queue to be retried on transient errors.
     """
-    data = request.get_data()
+    data = request.body
     attrs = {
         key: value
         for key, value in dict(
@@ -115,10 +116,10 @@ def submit(q: SQLiteAckQueue, topic: str, **kwargs) -> Tuple[str, int]:
             uri=request.path,
             protocol=request.scheme,
             method=request.method,
-            args=request.query_string.decode(),
-            remote_addr=request.remote_addr,
-            content_length=str(request.content_length),
-            date=request.date,
+            args=request.query_string,
+            remote_addr=request.ip,
+            content_length=request.headers.get("Content-Length"),
+            date=request.headers.get("Date"),
             dnt=request.headers.get("DNT"),
             host=request.host,
             user_agent=request.headers.get("User-Agent"),
@@ -132,30 +133,34 @@ def submit(q: SQLiteAckQueue, topic: str, **kwargs) -> Tuple[str, int]:
     except TRANSIENT_ERRORS:
         # transient api call failure, write to queue
         q.put((topic, data, attrs))
-    return "", 200
+    return raw(b"")
 
 
-def init_app(app: Flask):
-    """Initialize Flask app with url rules."""
+def init_app(app: Sanic):
+    """Initialize Sanic app with url rules."""
     # Use a SQLiteAckQueue because:
     # * we use acks to ensure messages only removed on success
     # * persist-queue's SQLite*Queue is faster than its Queue
     # * SQLite provides thread-safe and process-safe access
-    q = SQLiteAckQueue(**app.config.get_namespace("QUEUE_"))
+    q = SQLiteAckQueue(**{
+        key[6:].lower(): value
+        for key, value in app.config.items()
+        if key.startswith("QUEUE_")
+    })
     # route flush
-    app.add_url_rule("/__flush__", "flush", partial(flush, q))
+    app.add_route(partial(flush, q=q), "/__flush__", name="flush")
     # generate one view_func per topic
-    view_funcs = {
-        route.topic: partial(submit, q, route.topic)
+    handlers = {
+        route.topic: partial(submit, q=q, topic=route.topic)
         for route in app.config["ROUTE_TABLE"]
     }
     # add routes for ROUTE_TABLE
     for route in app.config["ROUTE_TABLE"]:
-        app.add_url_rule(
-            route.rule,
-            # required because view_func.__name__ does not exist
-            # must be a unique endpoint for each view_func
-            endpoint="submit_" + route.topic,
-            view_func=view_funcs[route.topic],
-            methods=route.methods,
+        app.add_route(
+            handler=handlers[route.topic],
+            uri=route.uri,
+            methods=[method.upper() for method in route.methods],
+            # required because handler.__name__ does not exist
+            # must be a unique name for each handler
+            name="submit_" + route.topic,
         )
